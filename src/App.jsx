@@ -139,6 +139,75 @@ const fitpro = {
   },
 };
 
+/* ============================================================
+   Protocolo SMA (app "SMART-TIME PRO", com.sma.smartv3 / SDK com.szabh.smable3)
+   Basado en la ingeniería inversa del proyecto Fogg (github.com/MiguelDLM/Fogg, docs/SMA_BLE_PROTOCOL.md).
+   Trama: AB | header(01, |0x10 respuesta, |0x20 NACK) | len BE (payload+3) | crc16 BE | cmd | key | flag | payload…
+   CRC-16/MODBUS sobre cmd+key+flag+payload. Enteros del payload en little-endian; tiempos en segundos desde 2000-01-01.
+   ============================================================ */
+const CRC16_MODBUS = (() => {
+  const t = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xa001 : c >>> 1;
+    t[i] = c;
+  }
+  return t;
+})();
+const crc16 = (bytes) => {
+  let crc = 0;
+  for (const b of bytes) crc = (crc >>> 8) ^ CRC16_MODBUS[(crc ^ b) & 0xff];
+  return crc & 0xffff;
+};
+const SMA_EPOCH = 946684800; // 2000-01-01T00:00:00Z
+
+const sma = {
+  FLAG: { UPDATE: 0x00, READ: 0x10, READ_CONTINUE: 0x11, CREATE: 0x20 },
+  frame(cmd, key, flag, payload = [], reply = false) {
+    const body = [cmd, key, flag, ...payload];
+    const crc = crc16(body);
+    const len = body.length;
+    return new Uint8Array([0xab, reply ? 0x11 : 0x01, (len >> 8) & 255, len & 255, (crc >> 8) & 255, crc & 255, ...body]);
+  },
+  session: () => sma.frame(0x03, 0x02, 0x20, [0xff, 0xff, 0xff, 0xff]),
+  time() {
+    const d = new Date();
+    return sma.frame(0x02, 0x01, 0x00, [d.getFullYear() - 2000, d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds()]);
+  },
+  readPower: () => sma.frame(0x02, 0x03, 0x10),
+  read: (key) => sma.frame(0x05, key, 0x10),
+  readContinue: (key) => sma.frame(0x05, key, 0x11),
+  ack: (cmd, key) => sma.frame(cmd, key, 0x00, [], true),
+  findWatch: (on) => sma.frame(0x02, 0x34, 0x00, [on ? 1 : 0]),
+  // bits: 7..6 estado (2=iniciar, 1=detener) · bit0 pulso · bit1 SpO2 · bit2 presión
+  measure: (on) => sma.frame(0x02, 0x36, 0x00, [on ? 0x87 : 0x47]),
+  HEALTH_KEYS: [0x03, 0x04, 0x09, 0x08, 0x02], // pulso, presión, SpO2, temperatura, actividad
+  init: () => [sma.session(), sma.time(), sma.readPower()],
+  sync: () => sma.HEALTH_KEYS.map((k) => sma.read(k)),
+  // Decodifica los registros de salud → lista de { at: Date, patch }
+  records(key, p) {
+    const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+    const size = { 0x02: 16, 0x03: 6, 0x04: 6, 0x08: 6, 0x09: 6 }[key];
+    const out = [];
+    if (!size) return out;
+    for (let o = 0; o + size <= p.length; o += size) {
+      const at = new Date((dv.getInt32(o, true) + SMA_EPOCH) * 1000);
+      let patch = null;
+      if (key === 0x03 && p[o + 4] > 0) patch = { hr: p[o + 4] };
+      else if (key === 0x04 && p[o + 4] > 0) patch = { sys: p[o + 4], dia: p[o + 5] };
+      else if (key === 0x09 && p[o + 4] > 0) patch = { spo2: p[o + 4] };
+      else if (key === 0x08) {
+        const raw = dv.getInt16(o + 4, true);
+        if (raw > 0) patch = { temp: raw > 1000 ? raw / 100 : raw / 10 };
+      } else if (key === 0x02) {
+        patch = { steps: p[o + 5] | (p[o + 6] << 8) | (p[o + 7] << 16), stepDistance: dv.getInt32(o + 12, true) };
+      }
+      if (patch) out.push({ at, patch });
+    }
+    return out;
+  },
+};
+
 const vendorKey = (k) => (/^\d+$/.test(k) ? Number(k) : k);
 const ALL_SERVICES = [...Object.values(SVC), ...Object.keys(VENDOR_SERVICES).map(vendorKey)];
 
@@ -353,9 +422,10 @@ function App() {
   }, []);
 
   // Publica nuevas lecturas al estado, al registro CSV y a la cola de Supabase
-  const push = useCallback((id, patch) => {
+  // `at` (opcional): fecha real de la medición, para registros históricos descargados de la pulsera
+  const push = useCallback((id, patch, at) => {
     dispatch({ type: "metrics", id, patch });
-    const t = new Date().toISOString();
+    const t = (at || new Date()).toISOString();
     const name = names.current.get(id) || id;
     const rows = [];
     for (const [k, v] of Object.entries(patch)) {
@@ -426,6 +496,66 @@ function App() {
     return drv.chain;
   };
 
+  const onUartData = (id, dv) => {
+    const drv = drivers.current.get(id);
+    if (drv?.protocol === "sma") onSmaData(id, dv);
+    else if (drv?.protocol === "fitpro") onFitproData(id, dv);
+  };
+
+  // Reensambla tramas SMA (AB …) y las procesa
+  const onSmaData = (id, dv) => {
+    const drv = drivers.current.get(id);
+    const bytes = Array.from(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
+    if (!drv.buf.length && bytes[0] !== 0xab) return;
+    drv.buf.push(...bytes);
+    while (drv.buf.length >= 9) {
+      if (drv.buf[0] !== 0xab) {
+        drv.buf = [];
+        break;
+      }
+      const total = ((drv.buf[2] << 8) | drv.buf[3]) + 6;
+      if (total > 4096) {
+        drv.buf = [];
+        break;
+      }
+      if (drv.buf.length < total) break;
+      const f = drv.buf.splice(0, total);
+      if (((f[4] << 8) | f[5]) !== crc16(f.slice(6))) continue; // trama corrupta
+      handleSmaFrame(id, drv, f[1], f[6], f[7], f[8], new Uint8Array(f.slice(9)));
+    }
+  };
+
+  const handleSmaFrame = (id, drv, header, cmd, key, flag, payload) => {
+    if (header & 0x20) return; // NACK: la pulsera no admite el comando
+    if (cmd === 0x03 && key === 0x02) {
+      dispatch({ type: "upsert", id, patch: { session: true } });
+      sendPackets(id, sma.sync()); // sesión abierta → descargar historial
+      return;
+    }
+    if (cmd === 0x02 && key === 0x03 && payload.length) {
+      push(id, { battery: payload[0] });
+      return;
+    }
+    if (cmd === 0x02 && key === 0x36 && payload.length) {
+      // progreso de la medición: al terminar (o fallar) se leen los resultados
+      sendPackets(id, [sma.read(0x03), sma.read(0x04), sma.read(0x09)]);
+      return;
+    }
+    if (cmd === 0x05) {
+      if (!payload.length) return; // fin de datos o ACK vacío
+      const recs = sma.records(key, payload).sort((a, b) => a.at - b.at);
+      for (const r of recs) {
+        const k = `${key}|${r.at.getTime()}`;
+        if (drv.seen.has(k)) continue; // ya registrado en esta sesión
+        drv.seen.add(k);
+        push(id, r.patch, r.at);
+      }
+      const packets = [sma.ack(cmd, key)];
+      if (flag !== 0x00 && (drv.continues[key] = (drv.continues[key] || 0) + 1) <= 30) packets.push(sma.readContinue(key));
+      sendPackets(id, packets, 80);
+    }
+  };
+
   // Reensambla paquetes FitPro (pueden llegar partidos en varias notificaciones de 20 bytes)
   const onFitproData = (id, dv) => {
     const drv = drivers.current.get(id);
@@ -448,15 +578,35 @@ function App() {
     }
   };
 
+  const measureTimers = useRef(new Map());
+
   const command = (id, action) => {
+    const drv = drivers.current.get(id);
+    if (!drv) return;
+    const isSma = drv.protocol === "sma";
+    clearTimeout(measureTimers.current.get(id));
     if (action === "hr-start") {
-      sendPackets(id, [fitpro.measureHr(true)]);
+      drv.continues = {};
+      sendPackets(id, [isSma ? sma.measure(true) : fitpro.measureHr(true)]);
       dispatch({ type: "upsert", id, patch: { measuring: true } });
+      if (isSma) {
+        // Respaldo por si la pulsera no avisa el fin de la medición: leer resultados a los 30, 60 y 90 s
+        let n = 0;
+        const poll = () => {
+          sendPackets(id, [sma.read(0x03), sma.read(0x04), sma.read(0x09)]);
+          if (++n < 3) measureTimers.current.set(id, setTimeout(poll, 30000));
+          else dispatch({ type: "upsert", id, patch: { measuring: false } });
+        };
+        measureTimers.current.set(id, setTimeout(poll, 30000));
+      }
     } else if (action === "hr-stop") {
-      sendPackets(id, [fitpro.measureHr(false)]);
+      sendPackets(id, [isSma ? sma.measure(false) : fitpro.measureHr(false)]);
       dispatch({ type: "upsert", id, patch: { measuring: false } });
     } else if (action === "sync") {
-      sendPackets(id, fitpro.init());
+      drv.continues = {};
+      sendPackets(id, isSma ? [sma.time(), sma.readPower(), ...sma.sync()] : fitpro.init());
+    } else if (action === "find") {
+      sendPackets(id, [isSma ? sma.findWatch(true) : fitpro.craft(0x12, 0x0b, [1])]);
     }
   };
 
@@ -496,7 +646,7 @@ function App() {
                 ch.oncharacteristicvaluechanged = (e) => {
                   const dv = e.target.value;
                   dispatch({ type: "log", id, entry: { t: Date.now(), dir: "rx", chr: uuidLabel(ch.uuid), hex: toHex(dv) } });
-                  if (uart) onFitproData(id, dv);
+                  if (uart) onUartData(id, dv);
                 };
                 await ch.startNotifications().catch(() => {});
               }
@@ -532,15 +682,16 @@ function App() {
 
         let protocol = null;
         if (uartTx && uartRx) {
-          // Nordic UART → intentar protocolo FitPro
-          protocol = "fitpro";
-          drivers.current.set(id, { tx: uartTx, buf: [], chain: Promise.resolve() });
-          ["hr", "spo2", "bp", "steps"].forEach((f) => features.add(f));
-          info.protocol = "FitPro";
+          // Nordic UART estándar (…dca9e) → SMA (SMART-TIME PRO); variante …dca9d → FitPro
+          protocol = uartTx.uuid.endsWith("9e") ? "sma" : "fitpro";
+          drivers.current.set(id, { protocol, tx: uartTx, buf: [], chain: Promise.resolve(), seen: new Set(), continues: {} });
+          ["hr", "spo2", "bp", "steps", "battery"].forEach((f) => features.add(f));
+          if (protocol === "sma") features.add("temp");
+          info.protocol = protocol === "sma" ? "SMA" : "FitPro";
         }
 
         dispatch({ type: "upsert", id, patch: { status: "connected", features: [...features], info, explore, protocol } });
-        if (protocol === "fitpro") sendPackets(id, fitpro.init());
+        if (protocol) sendPackets(id, protocol === "sma" ? sma.init() : fitpro.init());
       } catch (e) {
         dispatch({ type: "upsert", id, patch: { status: "disconnected" } });
         setError(`No se pudo conectar a ${device.name || "el dispositivo"}: ${e.message}`);
@@ -632,6 +783,7 @@ function App() {
     const bytes = hex.replace(/0x/gi, "").replace(/[^0-9a-f]/gi, "");
     if (!ch || !bytes || bytes.length % 2) return setError("Hex inválido: usa pares de dígitos, ej. 'ab 01 ff'.");
     const data = new Uint8Array(bytes.match(/../g).map((b) => parseInt(b, 16)));
+    if (drivers.current.get(id)?.tx === ch) return sendPackets(id, [data]); // misma cola que el driver
     try {
       if (ch.properties.writeWithoutResponse) await ch.writeValueWithoutResponse(data);
       else await ch.writeValueWithResponse(data);
@@ -788,7 +940,7 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
           </p>
         </div>
         <div className="actions">
-          {d.status === "connected" && d.protocol === "fitpro" && (
+          {d.status === "connected" && d.protocol && (
             <>
               <button
                 className={`btn sm ${d.measuring ? "" : "primary"}`}
@@ -797,6 +949,7 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
                 {d.measuring ? "■ Detener medición" : "❤ Medir"}
               </button>
               <button className="btn sm" onClick={() => onCommand(d.id, "sync")}>⟳ Sincronizar</button>
+              <button className="btn sm" onClick={() => onCommand(d.id, "find")}>📳 Vibrar</button>
             </>
           )}
           {d.status === "connected" && <button className="btn sm" onClick={() => onDisconnect(d.id)}>Desconectar</button>}
@@ -805,10 +958,12 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
         </div>
       </div>
 
-      {d.status === "connected" && d.protocol === "fitpro" && (
+      {d.status === "connected" && d.protocol && (
         <p className="muted pad">
-          Protocolo FitPro detectado. Pulsa <b>❤ Medir</b> y mantén la pulsera bien ajustada: la medición tarda entre 30 y 60 s y
-          entonces llegan pulso, presión y SpO₂.
+          Protocolo {d.info.protocol} detectado
+          {d.protocol === "sma" && (d.session ? " · sesión abierta ✓" : " · abriendo sesión…")}. Pulsa <b>❤ Medir</b> y mantén
+          la pulsera bien ajustada: la medición tarda entre 30 y 90 s. <b>⟳ Sincronizar</b> descarga lo que la pulsera midió por su
+          cuenta.
         </p>
       )}
 
@@ -879,6 +1034,24 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
   );
 }
 
+const hexOf = (u) => Array.from(u, (b) => b.toString(16).padStart(2, "0")).join(" ");
+const FITPRO_PRESETS = [
+  ["📳 Vibrar pulsera", "cd 00 06 12 01 0b 00 01 01"],
+  ["❤ Medir pulso", "cd 00 06 12 01 18 00 01 01"],
+  ["■ Detener", "cd 00 06 12 01 18 00 01 00"],
+  ["👣 Pasos", "cd 00 06 15 01 06 00 01 01"],
+  ["ℹ Info", "cd 00 05 20 01 02 00 00"],
+];
+const SMA_PRESETS = [
+  ["🔑 Sesión", hexOf(sma.session())],
+  ["📳 Vibrar", hexOf(sma.findWatch(true))],
+  ["❤ Medir", hexOf(sma.measure(true))],
+  ["■ Detener", hexOf(sma.measure(false))],
+  ["❤ Leer pulsos", hexOf(sma.read(0x03))],
+  ["🔋 Batería", hexOf(sma.readPower())],
+  ["📡 Pulso en vivo (0x0224)", hexOf(sma.frame(0x02, 0x24, 0x00, [1]))],
+];
+
 function Explorer({ d, onWrite, onRead }) {
   const writable = d.explore.flatMap((s) => s.chars.filter((c) => c.props.includes("write") || c.props.includes("writeNR")));
   const [target, setTarget] = useState(writable[0]?.key || "");
@@ -922,14 +1095,8 @@ function Explorer({ d, onWrite, onRead }) {
           <input value={hex} onChange={(e) => setHex(e.target.value)} placeholder="Bytes en hex, ej. ab 00 04 ff 31 0a 01" />
           <button className="btn sm primary" type="submit">Enviar</button>
           <div className="presets">
-            <span className="muted">Comandos FitPro:</span>
-            {[
-              ["📳 Vibrar pulsera", "cd 00 06 12 01 0b 00 01 01"],
-              ["❤ Medir pulso", "cd 00 06 12 01 18 00 01 01"],
-              ["■ Detener", "cd 00 06 12 01 18 00 01 00"],
-              ["👣 Pasos", "cd 00 06 15 01 06 00 01 01"],
-              ["ℹ Info", "cd 00 05 20 01 02 00 00"],
-            ].map(([label, cmd]) => (
+            <span className="muted">Comandos {d.protocol === "sma" ? "SMA" : "FitPro"}:</span>
+            {(d.protocol === "sma" ? SMA_PRESETS : FITPRO_PRESETS).map(([label, cmd]) => (
               <button key={label} type="button" className="btn sm ghost" onClick={() => setHex(cmd)}>
                 {label}
               </button>
