@@ -658,7 +658,7 @@ function App() {
       drv.liveTimer = setInterval(() => {
         drv.continues = {};
         sendPackets(id, [sma.read(0x03), sma.read(0x09)]);
-      }, 20000);
+      }, 5000); // durante una medición iniciada en la pulsera, ella guarda un registro cada 1–2 s
       dispatch({ type: "upsert", id, patch: { live: true } });
     } else if (action === "live-stop" && isSma) {
       clearInterval(drv.liveTimer);
@@ -1047,8 +1047,8 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
           cuenta.
           {d.protocol === "sma" &&
             (d.live
-              ? " 📡 En vivo: la pulsera mide cada minuto y se consulta cada 20 s (gasta más batería; al salir se restaura su configuración)."
-              : " 📡 En vivo hace que mida cada minuto y actualiza solo.")}
+              ? " 📡 En vivo: se consulta la pulsera cada 5 s y mide sola cada minuto. Para ver el pulso segundo a segundo, inicia la medición de pulso EN LA PULSERA. Al salir se restaura su configuración."
+              : " 📡 En vivo consulta la pulsera cada 5 s; combínalo con iniciar la medición de pulso en la propia pulsera.")}
         </p>
       )}
 
