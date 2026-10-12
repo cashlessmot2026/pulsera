@@ -1,5 +1,19 @@
 import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
+
+/* ============================================================
+   Supabase (la anon key es pública por diseño; la seguridad la da RLS)
+   ============================================================ */
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "https://xetflthjncbypzigtsay.supabase.co";
+const SUPABASE_ANON_KEY =
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhldGZsdGhqbmNieXB6aWd0c2F5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2NTI0MjgsImV4cCI6MjEwNDIyODQyOH0.G1e01PJoqoKPxlzmgHvDwddy4PZBg15qoEc2lmmrsa8";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+const TABLE = "lecturas";
+const SYNC_MS = 3000; // cada cuánto se envía el lote pendiente
+const BATCH = 500;
+const SESSION_ID = crypto.randomUUID(); // agrupa las lecturas de esta sesión de la app
 
 /* ============================================================
    Servicios y características BLE estándar (Bluetooth SIG)
@@ -181,7 +195,11 @@ function App() {
   const btDevices = useRef(new Map()); // id → BluetoothDevice
   const demoTimers = useRef(new Map()); // id → intervalId
   const names = useRef(new Map());
-  const records = useRef([]); // registros en memoria (luego → base de datos)
+  const records = useRef([]); // registros en memoria (para CSV)
+  const queue = useRef([]); // lecturas pendientes de enviar a Supabase
+  const [saveDb, setSaveDb] = useState(true);
+  const saveDbRef = useRef(true);
+  const [db, setDb] = useState({ synced: 0, pending: 0, error: "", last: null });
 
   const supported = typeof navigator !== "undefined" && !!navigator.bluetooth;
 
@@ -196,17 +214,50 @@ function App() {
 
   useEffect(() => () => demoTimers.current.forEach(clearInterval), []);
 
-  // Publica nuevas lecturas al estado y al registro
+  useEffect(() => {
+    saveDbRef.current = saveDb;
+    if (!saveDb) queue.current = [];
+  }, [saveDb]);
+
+  // Envío periódico por lotes a Supabase; si falla, las lecturas vuelven a la cola
+  useEffect(() => {
+    let busy = false;
+    const flush = async () => {
+      if (busy || !queue.current.length) return;
+      busy = true;
+      const batch = queue.current.splice(0, BATCH);
+      const { error } = await supabase.from(TABLE).insert(batch);
+      if (error) {
+        queue.current.unshift(...batch);
+        if (queue.current.length > 50000) queue.current.splice(0, queue.current.length - 50000);
+        setDb((s) => ({ ...s, pending: queue.current.length, error: error.message }));
+      } else {
+        setDb((s) => ({ synced: s.synced + batch.length, pending: queue.current.length, error: "", last: Date.now() }));
+      }
+      busy = false;
+    };
+    const t = setInterval(flush, SYNC_MS);
+    return () => clearInterval(t);
+  }, []);
+
+  // Publica nuevas lecturas al estado, al registro CSV y a la cola de Supabase
   const push = useCallback((id, patch) => {
     dispatch({ type: "metrics", id, patch });
     const t = new Date().toISOString();
     const name = names.current.get(id) || id;
+    const rows = [];
     for (const [k, v] of Object.entries(patch)) {
-      if (typeof v === "number" && Number.isFinite(v)) records.current.push({ t, device: name, metric: k, value: v });
+      if (typeof v === "number" && Number.isFinite(v)) rows.push({ metric: k, value: v });
     }
-    if (patch.rrNew) patch.rrNew.forEach((v) => records.current.push({ t, device: name, metric: "rr_ms", value: v }));
+    if (patch.rrNew) patch.rrNew.forEach((v) => rows.push({ metric: "rr_ms", value: v }));
+    rows.forEach((r) => records.current.push({ t, device: name, ...r }));
     if (records.current.length > 100000) records.current.splice(0, records.current.length - 100000);
     setRecordCount(records.current.length);
+    if (saveDbRef.current) {
+      rows.forEach((r) =>
+        queue.current.push({ recorded_at: t, session_id: SESSION_ID, device_id: id, device_name: name, ...r })
+      );
+    }
   }, []);
 
   // Suscribe una característica: lectura inicial + notificaciones
@@ -355,7 +406,7 @@ function App() {
           pressure: 101.3 + Math.random() * 0.2,
         });
       }
-      if (tick % 15 === 0) {
+      if (tick === 1 || tick % 15 === 0) {
         battery = Math.max(0, battery - 1);
         push(id, { battery, sys: 115 + Math.random() * 10, dia: 75 + Math.random() * 6, bpPulse: Math.round(hr) });
       }
@@ -431,6 +482,21 @@ function App() {
         </div>
       </header>
 
+      <div className={`dbbar ${db.error ? "err" : ""}`}>
+        <label>
+          <input type="checkbox" checked={saveDb} onChange={(e) => setSaveDb(e.target.checked)} /> Guardar en Supabase
+        </label>
+        <span className="muted">
+          {!saveDb
+            ? "Guardado desactivado"
+            : db.error
+            ? `⚠ Error: ${db.error} · ${db.pending} pendientes`
+            : `☁ ${db.synced} lecturas guardadas · ${db.pending} pendientes${
+                db.last ? ` · último envío ${new Date(db.last).toLocaleTimeString()}` : ""
+              }`}
+        </span>
+      </div>
+
       {error && (
         <div className="error" onClick={() => setError("")}>
           ⚠ {error} <span className="muted">(toca para cerrar)</span>
@@ -454,7 +520,7 @@ function App() {
         ))
       )}
 
-      <footer className="muted">Los datos solo viven en memoria durante la sesión. Exporta a CSV para guardarlos.</footer>
+      <footer className="muted">Las lecturas se guardan en Supabase (tabla “{TABLE}”). También puedes exportarlas a CSV.</footer>
     </div>
   );
 }
@@ -721,6 +787,9 @@ h1{font-size:1.3rem} h2{font-size:1.1rem}
 .btn.primary:hover:not(:disabled){background:#ff6b85}
 .btn.sm{padding:6px 10px;font-size:.8rem}
 .btn.ghost{background:transparent}
+.dbbar{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;background:#121a2e;border:1px solid #1f2a47;border-radius:10px;padding:8px 12px;margin-bottom:16px;font-size:.9rem}
+.dbbar.err{border-color:#ef476f}
+.dbbar label{display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:600}
 .error{background:#3b1220;border:1px solid #ef476f;color:#ffd6dd;padding:10px 14px;border-radius:10px;margin-bottom:16px;cursor:pointer}
 .empty{text-align:center;padding:60px 16px;background:#121a2e;border:1px dashed #2a3758;border-radius:16px}
 .empty-icon{font-size:48px}
