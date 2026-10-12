@@ -46,6 +46,48 @@ const CHR = {
 };
 
 const HISTORY = 90; // puntos guardados para las gráficas en vivo
+
+// Servicios propietarios frecuentes en pulseras/relojes genéricos. Web Bluetooth solo deja ver
+// los servicios declarados en optionalServices, así que se listan para poder explorarlos.
+const VENDOR_SERVICES = {
+  0xfee7: "Propietario (WeChat/genérico)",
+  0xfee0: "Propietario (Mi Band y clones)",
+  0xfee1: "Propietario (Mi Band y clones)",
+  0xfee9: "Propietario genérico",
+  0xfeea: "Propietario (Da Fit)",
+  0xfe95: "Xiaomi",
+  0xfe59: "Nordic DFU",
+  0xfff0: "Propietario genérico (FFF0)",
+  0xffe0: "Propietario genérico (FFE0)",
+  0xffd0: "Propietario genérico (FFD0)",
+  0xffc0: "Propietario genérico (FFC0)",
+  0xffb0: "Propietario genérico (FFB0)",
+  0xffa0: "Propietario genérico (FFA0)",
+  0xff00: "Propietario genérico (FF00)",
+  0xae00: "Chip JieLi (AE00)",
+  0xae30: "Chip JieLi (AE30)",
+  0x18d0: "Propietario (Lefun/ZeRun)",
+  0x0af0: "Propietario (VeryFit/IDO)",
+  0x1802: "Alerta inmediata",
+  0x1805: "Hora actual",
+  0x181c: "Datos de usuario",
+  "6e400001-b5a3-f393-e0a9-e50e24dcca9e": "Nordic UART (FitPro y otros)",
+  "f0080001-0451-4000-b000-000000000000": "Propietario (H Band/Veepoo)",
+  "000001ff-3c17-d293-8e48-14fe2e4da212": "Propietario (GloryFit)",
+  "0000d0ff-3c17-d293-8e48-14fe2e4da212": "Propietario (Telink)",
+};
+const vendorKey = (k) => (/^\d+$/.test(k) ? Number(k) : k);
+const ALL_SERVICES = [...Object.values(SVC), ...Object.keys(VENDOR_SERVICES).map(vendorKey)];
+
+const uuidLabel = (uuid) => {
+  const s = shortUuid(uuid);
+  return s != null ? "0x" + s.toString(16).padStart(4, "0").toUpperCase() : uuid;
+};
+const serviceName = (uuid) => VENDOR_SERVICES[shortUuid(uuid) ?? uuid] || "Desconocido";
+const toHex = (dv) =>
+  Array.from(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength), (b) => b.toString(16).padStart(2, "0")).join(" ");
+const propsList = (p) =>
+  ["read", "write", "writeWithoutResponse", "notify", "indicate"].filter((k) => p[k]).map((k) => (k === "writeWithoutResponse" ? "writeNR" : k));
 const BODY_LOCATIONS = ["Otro", "Pecho", "Muñeca", "Dedo", "Mano", "Lóbulo oreja", "Pie"];
 
 /* ============================================================
@@ -172,6 +214,11 @@ function reducer(state, a) {
       if (patch.spo2 != null && !Number.isNaN(patch.spo2)) m.spo2History = [...m.spo2History, patch.spo2].slice(-HISTORY);
       return { ...state, [a.id]: { ...d, metrics: m } };
     }
+    case "log": {
+      const d = state[a.id];
+      if (!d) return state;
+      return { ...state, [a.id]: { ...d, log: [a.entry, ...(d.log || [])].slice(0, 80) } };
+    }
     case "remove": {
       const next = { ...state };
       delete next[a.id];
@@ -193,6 +240,7 @@ function App() {
   const [recordCount, setRecordCount] = useState(0);
 
   const btDevices = useRef(new Map()); // id → BluetoothDevice
+  const chars = useRef(new Map()); // `${id}|${servicio}|${caracteristica}` → BluetoothRemoteGATTCharacteristic
   const demoTimers = useRef(new Map()); // id → intervalId
   const names = useRef(new Map());
   const records = useRef([]); // registros en memoria (para CSV)
@@ -306,12 +354,36 @@ function App() {
 
       try {
         const server = await device.gatt.connect();
-        const services = await server.getPrimaryServices();
+        // Si no expone ningún servicio conocido, getPrimaryServices lanza NotFoundError: no es fatal
+        const services = await server.getPrimaryServices().catch(() => []);
         const features = new Set();
         const info = {};
+        const explore = [];
+        const standard = new Set(Object.values(SVC));
 
         for (const s of services) {
           const u = shortUuid(s.uuid);
+          if (!standard.has(u)) {
+            // Servicio propietario: listar características y escuchar sus notificaciones en crudo
+            const entry = { service: s.uuid, name: serviceName(s.uuid), chars: [] };
+            const list = await s.getCharacteristics().catch(() => []);
+            for (const ch of list) {
+              const key = `${id}|${s.uuid}|${ch.uuid}`;
+              chars.current.set(key, ch);
+              entry.chars.push({ key, uuid: ch.uuid, props: propsList(ch.properties) });
+              if (ch.properties.notify || ch.properties.indicate) {
+                ch.oncharacteristicvaluechanged = (e) =>
+                  dispatch({
+                    type: "log",
+                    id,
+                    entry: { t: Date.now(), dir: "rx", chr: uuidLabel(ch.uuid), hex: toHex(e.target.value) },
+                  });
+                await ch.startNotifications().catch(() => {});
+              }
+            }
+            explore.push(entry);
+            continue;
+          }
           if (u === SVC.HEART_RATE) {
             if (await subscribe(s, CHR.HR_MEASUREMENT, (dv) => push(id, parse.heartRate(dv)))) features.add("hr");
             await subscribe(s, CHR.BODY_LOCATION, (dv) => (info.location = BODY_LOCATIONS[dv.getUint8(0)] || "Otro"));
@@ -338,7 +410,7 @@ function App() {
           }
         }
 
-        dispatch({ type: "upsert", id, patch: { status: "connected", features: [...features], info } });
+        dispatch({ type: "upsert", id, patch: { status: "connected", features: [...features], info, explore } });
       } catch (e) {
         dispatch({ type: "upsert", id, patch: { status: "disconnected" } });
         setError(`No se pudo conectar a ${device.name || "el dispositivo"}: ${e.message}`);
@@ -357,7 +429,7 @@ function App() {
     try {
       const device = await navigator.bluetooth.requestDevice({
         acceptAllDevices: true,
-        optionalServices: Object.values(SVC),
+        optionalServices: ALL_SERVICES,
       });
       await connect(device);
     } catch (e) {
@@ -422,6 +494,31 @@ function App() {
       return;
     }
     btDevices.current.get(id)?.gatt?.disconnect();
+  };
+
+  // Explorador: escribir bytes (hex) o leer una característica propietaria
+  const writeChar = async (id, key, hex) => {
+    const ch = chars.current.get(key);
+    const bytes = hex.replace(/0x/gi, "").replace(/[^0-9a-f]/gi, "");
+    if (!ch || !bytes || bytes.length % 2) return setError("Hex inválido: usa pares de dígitos, ej. 'ab 01 ff'.");
+    const data = new Uint8Array(bytes.match(/../g).map((b) => parseInt(b, 16)));
+    try {
+      if (ch.properties.writeWithoutResponse) await ch.writeValueWithoutResponse(data);
+      else await ch.writeValueWithResponse(data);
+      dispatch({ type: "log", id, entry: { t: Date.now(), dir: "tx", chr: uuidLabel(ch.uuid), hex: toHex(new DataView(data.buffer)) } });
+    } catch (e) {
+      setError(`Error al escribir: ${e.message}`);
+    }
+  };
+
+  const readChar = async (id, key) => {
+    const ch = chars.current.get(key);
+    try {
+      const dv = await ch.readValue();
+      dispatch({ type: "log", id, entry: { t: Date.now(), dir: "read", chr: uuidLabel(ch.uuid), hex: toHex(dv) } });
+    } catch (e) {
+      setError(`Error al leer: ${e.message}`);
+    }
   };
 
   const reconnect = (id) => {
@@ -516,7 +613,15 @@ function App() {
         </div>
       ) : (
         list.map((d) => (
-          <DevicePanel key={d.id} d={d} onDisconnect={disconnect} onReconnect={reconnect} onRemove={remove} />
+          <DevicePanel
+            key={d.id}
+            d={d}
+            onDisconnect={disconnect}
+            onReconnect={reconnect}
+            onRemove={remove}
+            onWrite={writeChar}
+            onRead={readChar}
+          />
         ))
       )}
 
@@ -530,7 +635,7 @@ function App() {
    ============================================================ */
 const STATUS_LABEL = { connecting: "Conectando…", connected: "Conectado", disconnected: "Desconectado" };
 
-function DevicePanel({ d, onDisconnect, onReconnect, onRemove }) {
+function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead }) {
   const m = d.metrics;
   const f = new Set(d.features);
   const ago = useNow(d.status === "connected");
@@ -559,7 +664,11 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove }) {
       </div>
 
       {d.status === "connected" && d.features.length === 0 && (
-        <p className="muted pad">Conectado, pero no se encontraron servicios estándar compatibles en este dispositivo.</p>
+        <p className="muted pad">
+          {d.explore?.length
+            ? "Este dispositivo no usa los servicios estándar de salud: usa un protocolo propietario. Revisa el Explorador BLE abajo para ver sus datos en crudo."
+            : "Conectado, pero no expone ningún servicio accesible. Cierra la app oficial de la pulsera (o desvincúlala en Ajustes → Bluetooth) y vuelve a intentar."}
+        </p>
       )}
 
       <div className="grid">
@@ -604,7 +713,71 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove }) {
           </Card>
         )}
       </div>
+
+      {!d.demo && d.explore?.length > 0 && <Explorer d={d} onWrite={onWrite} onRead={onRead} />}
     </section>
+  );
+}
+
+function Explorer({ d, onWrite, onRead }) {
+  const writable = d.explore.flatMap((s) => s.chars.filter((c) => c.props.includes("write") || c.props.includes("writeNR")));
+  const [target, setTarget] = useState(writable[0]?.key || "");
+  const [hex, setHex] = useState("");
+  const log = d.log || [];
+
+  return (
+    <details className="explorer" open={d.features.length === 0}>
+      <summary>🔬 Explorador BLE · {d.explore.length} servicio(s) propietario(s) · {log.length} paquetes</summary>
+
+      {d.explore.map((s) => (
+        <div key={s.service} className="svc">
+          <b>{uuidLabel(s.service)}</b> <span className="muted">{s.name}</span>
+          <ul>
+            {s.chars.map((c) => (
+              <li key={c.key}>
+                <code>{uuidLabel(c.uuid)}</code> <span className="muted">[{c.props.join(", ")}]</span>
+                {c.props.includes("read") && (
+                  <button className="btn sm ghost" onClick={() => onRead(d.id, c.key)}>Leer</button>
+                )}
+              </li>
+            ))}
+            {s.chars.length === 0 && <li className="muted">Sin características accesibles</li>}
+          </ul>
+        </div>
+      ))}
+
+      {writable.length > 0 && (
+        <form
+          className="tx"
+          onSubmit={(e) => {
+            e.preventDefault();
+            onWrite(d.id, target, hex);
+          }}
+        >
+          <select value={target} onChange={(e) => setTarget(e.target.value)}>
+            {writable.map((c) => (
+              <option key={c.key} value={c.key}>{uuidLabel(c.uuid)}</option>
+            ))}
+          </select>
+          <input value={hex} onChange={(e) => setHex(e.target.value)} placeholder="Bytes en hex, ej. ab 00 04 ff 31 0a 01" />
+          <button className="btn sm primary" type="submit">Enviar</button>
+        </form>
+      )}
+
+      <div className="log">
+        {log.length === 0 ? (
+          <p className="muted">
+            Esperando notificaciones… Mueve la pulsera o inicia una medición de pulso desde la propia pulsera para ver los paquetes.
+          </p>
+        ) : (
+          log.map((l, i) => (
+            <div key={i} className={`pkt ${l.dir}`}>
+              <span className="muted">{new Date(l.t).toLocaleTimeString()}</span> <b>{l.dir}</b> <code>{l.chr}</code> {l.hex}
+            </div>
+          ))
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -820,6 +993,18 @@ h1{font-size:1.3rem} h2{font-size:1.1rem}
 .spark{width:100%;display:block;margin-top:10px}
 .spark-empty{display:grid;place-items:center;color:#56637f;font-size:.8rem;margin-top:10px;border:1px dashed #1f2a47;border-radius:8px}
 .ring-row{display:flex;align-items:center;gap:12px}
+.explorer{margin-top:14px;background:#121a2e;border:1px solid #1f2a47;border-radius:14px;padding:12px 14px}
+.explorer summary{cursor:pointer;font-weight:700}
+.svc{margin-top:10px;font-size:.9rem}
+.svc ul{margin:6px 0 0;padding-left:18px}
+.svc li{margin:4px 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+code{font-family:ui-monospace,Consolas,monospace;font-size:.85em;color:#a5b4fc;word-break:break-all}
+.tx{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.tx select,.tx input{background:#0b1020;color:#e2e8f0;border:1px solid #2a3758;border-radius:8px;padding:6px 8px;font-family:ui-monospace,Consolas,monospace}
+.tx input{flex:1;min-width:180px}
+.log{margin-top:12px;max-height:260px;overflow:auto;background:#0b1020;border-radius:8px;padding:8px;font-family:ui-monospace,Consolas,monospace;font-size:.8rem}
+.pkt{padding:2px 0;word-break:break-all}
+.pkt.tx b{color:#ffb703}.pkt.rx b{color:#06d6a0}.pkt.read b{color:#4cc9f0}
 .bar{height:10px;background:#22304f;border-radius:999px;overflow:hidden;margin-top:10px}
 .bar div{height:100%;transition:width .6s}
 footer{text-align:center;margin-top:24px}
