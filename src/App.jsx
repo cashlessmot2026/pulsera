@@ -181,6 +181,10 @@ const sma = {
   findWatch: (on) => sma.frame(0x02, 0x34, 0x00, [on ? 1 : 0]),
   // bits: 7..6 estado (2=iniciar, 1=detener) · bit0 pulso · bit1 SpO2 · bit2 presión
   measure: (on) => sma.frame(0x02, 0x36, 0x00, [on ? 0x87 : 0x47]),
+  // HR_MONITORING (verificado en hardware): [activo, h inicio, m inicio, h fin, m fin, intervalo en minutos]
+  readHrMonitoring: () => sma.frame(0x02, 0x16, 0x10),
+  hrMonitoring: (body) => sma.frame(0x02, 0x16, 0x00, body),
+  realtimeHr: (on) => sma.frame(0x02, 0x24, 0x00, [on ? 1 : 0]), // experimental (valor inferido)
   HEALTH_KEYS: [0x03, 0x04, 0x09, 0x08, 0x02], // pulso, presión, SpO2, temperatura, actividad
   init: () => [sma.session(), sma.time(), sma.readPower()],
   sync: () => sma.HEALTH_KEYS.map((k) => sma.read(k)),
@@ -536,6 +540,19 @@ function App() {
       push(id, { battery: payload[0] });
       return;
     }
+    if (cmd === 0x02 && key === 0x16 && payload.length >= 6) {
+      if (drv.awaitHrSetting) {
+        drv.hrOriginal = Array.from(payload.slice(0, 6)); // para restaurarla al salir del modo en vivo
+        drv.awaitHrSetting = false;
+      }
+      return;
+    }
+    if (cmd === 0x02 && key === 0x24 && payload.length) {
+      // pulso en tiempo real (si la pulsera soporta el comando experimental)
+      const bpm = payload[payload.length === 1 ? 0 : payload.length - 1];
+      if (bpm >= 30 && bpm <= 220) push(id, { hr: bpm });
+      return;
+    }
     if (cmd === 0x02 && key === 0x36 && payload.length) {
       // progreso de la medición: al terminar (o fallar) se leen los resultados
       sendPackets(id, [sma.read(0x03), sma.read(0x04), sma.read(0x09)]);
@@ -605,6 +622,21 @@ function App() {
     } else if (action === "sync") {
       drv.continues = {};
       sendPackets(id, isSma ? [sma.time(), sma.readPower(), ...sma.sync()] : fitpro.init());
+    } else if (action === "live-start" && isSma) {
+      drv.awaitHrSetting = true;
+      sendPackets(id, [sma.readHrMonitoring()], 1000).then(() =>
+        sendPackets(id, [sma.hrMonitoring([1, 0, 0, 23, 59, 1]), sma.realtimeHr(true), sma.measure(true)])
+      );
+      clearInterval(drv.liveTimer);
+      drv.liveTimer = setInterval(() => {
+        drv.continues = {};
+        sendPackets(id, [sma.read(0x03), sma.read(0x09)]);
+      }, 20000);
+      dispatch({ type: "upsert", id, patch: { live: true } });
+    } else if (action === "live-stop" && isSma) {
+      clearInterval(drv.liveTimer);
+      sendPackets(id, [sma.realtimeHr(false), sma.measure(false), sma.hrMonitoring(drv.hrOriginal || [1, 0, 0, 23, 59, 30])]);
+      dispatch({ type: "upsert", id, patch: { live: false } });
     } else if (action === "find") {
       sendPackets(id, [isSma ? sma.findWatch(true) : fitpro.craft(0x12, 0x0b, [1])]);
     }
@@ -617,7 +649,11 @@ function App() {
       names.current.set(id, device.name || "Dispositivo BLE");
       dispatch({ type: "upsert", id, patch: { name: device.name || "Dispositivo BLE", status: "connecting", demo: false } });
 
-      device.ongattserverdisconnected = () => dispatch({ type: "upsert", id, patch: { status: "disconnected" } });
+      device.ongattserverdisconnected = () => {
+        clearInterval(drivers.current.get(id)?.liveTimer);
+        clearTimeout(measureTimers.current.get(id));
+        dispatch({ type: "upsert", id, patch: { status: "disconnected", live: false, measuring: false } });
+      };
 
       try {
         const server = await device.gatt.connect();
@@ -948,6 +984,11 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
               >
                 {d.measuring ? "■ Detener medición" : "❤ Medir"}
               </button>
+              {d.protocol === "sma" && (
+                <button className={`btn sm ${d.live ? "primary" : ""}`} onClick={() => onCommand(d.id, d.live ? "live-stop" : "live-start")}>
+                  {d.live ? "■ Salir de en vivo" : "📡 En vivo"}
+                </button>
+              )}
               <button className="btn sm" onClick={() => onCommand(d.id, "sync")}>⟳ Sincronizar</button>
               <button className="btn sm" onClick={() => onCommand(d.id, "find")}>📳 Vibrar</button>
             </>
@@ -964,6 +1005,10 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, 
           {d.protocol === "sma" && (d.session ? " · sesión abierta ✓" : " · abriendo sesión…")}. Pulsa <b>❤ Medir</b> y mantén
           la pulsera bien ajustada: la medición tarda entre 30 y 90 s. <b>⟳ Sincronizar</b> descarga lo que la pulsera midió por su
           cuenta.
+          {d.protocol === "sma" &&
+            (d.live
+              ? " 📡 En vivo: la pulsera mide cada minuto y se consulta cada 20 s (gasta más batería; al salir se restaura su configuración)."
+              : " 📡 En vivo hace que mida cada minuto y actualiza solo.")}
         </p>
       )}
 
