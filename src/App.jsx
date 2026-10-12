@@ -188,6 +188,12 @@ const sma = {
   HEALTH_KEYS: [0x03, 0x04, 0x09, 0x08, 0x02], // pulso, presión, SpO2, temperatura, actividad
   init: () => [sma.session(), sma.time(), sma.readPower()],
   sync: () => sma.HEALTH_KEYS.map((k) => sma.read(k)),
+  // Hora de la pulsera: segundos desde 2000-01-01 en HORA LOCAL. El orden de bytes depende del firmware
+  // (Fogg documenta little-endian; la JW-10 usa big-endian), así que se elige el que da una fecha plausible.
+  plausible: (secs) => {
+    const ms = (secs + SMA_EPOCH) * 1000 + new Date().getTimezoneOffset() * 60000;
+    return ms > Date.UTC(2020, 0, 1) && ms < Date.now() + 2 * 86400000 ? new Date(ms) : null;
+  },
   // Decodifica los registros de salud → lista de { at: Date, patch }
   records(key, p) {
     const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
@@ -195,16 +201,20 @@ const sma = {
     const out = [];
     if (!size) return out;
     for (let o = 0; o + size <= p.length; o += size) {
-      const at = new Date((dv.getInt32(o, true) + SMA_EPOCH) * 1000);
+      let le = true;
+      let at = sma.plausible(dv.getInt32(o, true));
+      if (!at && (at = sma.plausible(dv.getInt32(o, false)))) le = false;
+      if (!at) continue; // registro vacío o con fecha imposible
       let patch = null;
       if (key === 0x03 && p[o + 4] > 0) patch = { hr: p[o + 4] };
       else if (key === 0x04 && p[o + 4] > 0) patch = { sys: p[o + 4], dia: p[o + 5] };
       else if (key === 0x09 && p[o + 4] > 0) patch = { spo2: p[o + 4] };
       else if (key === 0x08) {
-        const raw = dv.getInt16(o + 4, true);
+        const raw = dv.getInt16(o + 4, le);
         if (raw > 0) patch = { temp: raw > 1000 ? raw / 100 : raw / 10 };
       } else if (key === 0x02) {
-        patch = { steps: p[o + 5] | (p[o + 6] << 8) | (p[o + 7] << 16), stepDistance: dv.getInt32(o + 12, true) };
+        const steps = le ? p[o + 5] | (p[o + 6] << 8) | (p[o + 7] << 16) : (p[o + 5] << 16) | (p[o + 6] << 8) | p[o + 7];
+        patch = { steps, stepDistance: dv.getInt32(o + 12, le) };
       }
       if (patch) out.push({ at, patch });
     }
@@ -374,6 +384,18 @@ function App() {
   const [scanning, setScanning] = useState(false);
   const [installEvt, setInstallEvt] = useState(null);
   const [recordCount, setRecordCount] = useState(0);
+  const [view, setView] = useState(() => {
+    try {
+      return localStorage.getItem("pulsera.view") || "monitor";
+    } catch {
+      return "monitor";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("pulsera.view", view);
+    } catch {}
+  }, [view]);
 
   const btDevices = useRef(new Map()); // id → BluetoothDevice
   const chars = useRef(new Map()); // `${id}|${servicio}|${caracteristica}` → BluetoothRemoteGATTCharacteristic
@@ -411,7 +433,12 @@ function App() {
       if (busy || !queue.current.length) return;
       busy = true;
       const batch = queue.current.splice(0, BATCH);
-      const { error } = await supabase.from(TABLE).insert(batch);
+      // Los registros repetidos (mismo dispositivo, métrica, fecha y valor) se ignoran gracias al índice único
+      let { error } = await supabase
+        .from(TABLE)
+        .upsert(batch, { onConflict: "device_id,metric,recorded_at,value", ignoreDuplicates: true });
+      // 42P10: el índice único aún no existe (migración 002 sin ejecutar) → inserción normal
+      if (error?.code === "42P10") ({ error } = await supabase.from(TABLE).insert(batch));
       if (error) {
         queue.current.unshift(...batch);
         if (queue.current.length > 50000) queue.current.splice(0, queue.current.length - 50000);
@@ -918,7 +945,20 @@ function App() {
         </div>
       )}
 
-      {list.length === 0 ? (
+      <nav className="tabs" role="tablist">
+        {[
+          ["monitor", "📡 Monitor en vivo"],
+          ["analitica", "📊 Analítica"],
+        ].map(([v, label]) => (
+          <button key={v} role="tab" aria-selected={view === v} className={`tab ${view === v ? "on" : ""}`} onClick={() => setView(v)}>
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {view === "analitica" ? (
+        <Dashboard />
+      ) : list.length === 0 ? (
         <div className="empty">
           <div className="empty-icon">📡</div>
           <h2>Sin dispositivos conectados</h2>
@@ -1295,6 +1335,444 @@ function Sparkline({ data, color, height = 70 }) {
 /* ============================================================
    Utilidades
    ============================================================ */
+/* ============================================================
+   Analítica: lee la tabla de Supabase y la resume
+   ============================================================ */
+const DASH_METRICS = ["hr", "spo2", "sys", "dia", "steps", "temp", "battery"];
+const RANGES = [
+  ["24 h", 1],
+  ["7 días", 7],
+  ["30 días", 30],
+  ["Todo", null],
+];
+const C = { s1: "#3987e5", s2: "#d95926", grid: "#1f2a47", ink2: "#8b9bb8", surface: "#121a2e" }; // validados (dataviz) sobre #121a2e
+
+// Registros SMA guardados antes de corregir el orden de bytes: su fecha queda a años de cuándo se guardaron.
+// Si se aleja más de 2 días de created_at, se reinterpreta como big-endian en hora local.
+function fixDate(iso, createdIso) {
+  const ms = Date.parse(iso);
+  const created = Date.parse(createdIso);
+  if (!created || Math.abs(ms - created) < 2 * 86400000) return ms;
+  const b = new DataView(new ArrayBuffer(4));
+  b.setInt32(0, Math.round(ms / 1000) - SMA_EPOCH, true);
+  const fixed = (b.getInt32(0, false) + SMA_EPOCH) * 1000 + new Date().getTimezoneOffset() * 60000;
+  return fixed > Date.UTC(2020, 0, 1) && fixed < created + 86400000 ? fixed : ms;
+}
+
+function Dashboard() {
+  const [days, setDays] = useState(7);
+  const [device, setDevice] = useState("all");
+  const [rows, setRows] = useState(null);
+  const [status, setStatus] = useState("");
+
+  const load = useCallback(async () => {
+    setStatus("Cargando…");
+    const all = [];
+    try {
+      for (let from = 0; from < 50000; from += 1000) {
+        const { data, error } = await supabase
+          .from(TABLE)
+          .select("device_id,device_name,metric,value,recorded_at,created_at")
+          .in("metric", DASH_METRICS)
+          .order("recorded_at", { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        all.push(...data);
+        if (data.length < 1000) break;
+      }
+      // corrige fechas y quita duplicados exactos
+      const seen = new Set();
+      const clean = [];
+      for (const r of all) {
+        const t = fixDate(r.recorded_at, r.created_at);
+        // Los pasos de esos registros antiguos también se leyeron con los 3 bytes invertidos
+        if (r.metric === "steps" && t !== Date.parse(r.recorded_at)) {
+          const v = r.value;
+          r.value = ((v & 0xff) << 16) | (v & 0xff00) | ((v >> 16) & 0xff);
+        }
+        const k = `${r.device_id}|${r.metric}|${t}|${r.value}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        clean.push({ ...r, t, device: r.device_name || r.device_id });
+      }
+      clean.sort((a, b) => a.t - b.t);
+      setRows(clean);
+      setStatus("");
+    } catch (e) {
+      setStatus(`No se pudieron leer los datos: ${e.message}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const devices = rows ? [...new Set(rows.map((r) => r.device))] : [];
+  const since = days ? Date.now() - days * 86400000 : 0;
+  const data = (rows || []).filter((r) => r.t >= since && (device === "all" || r.device === device) && !r.device_id.startsWith("demo-"));
+  const by = (m) => data.filter((r) => r.metric === m);
+  const hr = by("hr");
+  const spo2 = by("spo2");
+  const sys = by("sys");
+  const dia = by("dia");
+  const steps = by("steps");
+  const temp = by("temp");
+  const hrVals = hr.map((r) => r.value);
+  const avg = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+  const pct = (a, p) => {
+    if (!a.length) return null;
+    const s = [...a].sort((x, y) => x - y);
+    return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
+  };
+  const last = (a) => (a.length ? a[a.length - 1] : null);
+  const span = days ? days * 86400000 : data.length ? data[data.length - 1].t - data[0].t : 0;
+
+  const zones = [
+    ["Reposo", "< 60", (v) => v < 60],
+    ["Normal", "60–99", (v) => v >= 60 && v < 100],
+    ["Elevado", "100–139", (v) => v >= 100 && v < 140],
+    ["Alto", "≥ 140", (v) => v >= 140],
+  ].map(([label, range, f]) => ({ label, range, n: hrVals.filter(f).length }));
+
+  const hourly = Array.from({ length: 24 }, (_, h) => {
+    const v = hr.filter((r) => new Date(r.t).getHours() === h).map((r) => r.value);
+    return { h, v: avg(v), n: v.length };
+  });
+
+  return (
+    <section className="dash">
+      <div className="filters">
+        <div className="seg" role="group" aria-label="Rango de tiempo">
+          {RANGES.map(([label, d]) => (
+            <button key={label} className={days === d ? "on" : ""} onClick={() => setDays(d)}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <select value={device} onChange={(e) => setDevice(e.target.value)} aria-label="Dispositivo">
+          <option value="all">Todos los dispositivos</option>
+          {devices.map((d) => (
+            <option key={d} value={d}>{d}</option>
+          ))}
+        </select>
+        <button className="btn sm" onClick={load}>⟳ Actualizar</button>
+        <span className="muted">{status || `${data.length} lecturas en el rango`}</span>
+      </div>
+
+      {rows && data.length === 0 ? (
+        <div className="empty">
+          <div className="empty-icon">📊</div>
+          <h2>Sin datos en este rango</h2>
+          <p className="muted">Conecta la pulsera y sincroniza, o elige un rango más amplio.</p>
+        </div>
+      ) : (
+        <>
+          <div className="kpis">
+            <Kpi label="Pulso promedio" value={fmt(avg(hrVals), 0)} unit="lpm" sub={hrVals.length ? `mín ${Math.min(...hrVals)} · máx ${Math.max(...hrVals)}` : "sin datos"} />
+            <Kpi label="Pulso en reposo (est.)" value={pct(hrVals, 10) ?? "--"} unit="lpm" sub="percentil 10 del rango" />
+            <Kpi label="SpO₂ promedio" value={fmt(avg(spo2.map((r) => r.value)), 0)} unit="%" sub={spo2.length ? `mínimo ${Math.min(...spo2.map((r) => r.value))} %` : "sin datos"} />
+            <Kpi
+              label="Presión arterial"
+              value={sys.length ? `${fmt(avg(sys.map((r) => r.value)), 0)}/${fmt(avg(dia.map((r) => r.value)), 0)}` : "--"}
+              unit="mmHg"
+              sub={sys.length ? `promedio de ${sys.length} mediciones` : "sin datos"}
+            />
+            <Kpi label="Pasos" value={last(steps)?.value?.toLocaleString("es") ?? "--"} unit="" sub={steps.length ? `último registro ${fmtTime(last(steps).t, span)}` : "sin datos"} />
+            <Kpi label="Temperatura" value={fmt(last(temp)?.value, 1)} unit="°C" sub={temp.length ? `promedio ${fmt(avg(temp.map((r) => r.value)), 1)} °C` : "sin datos"} />
+          </div>
+
+          <div className="charts">
+            <ChartCard title="Ritmo cardiaco" subtitle="lpm · banda gris = rango normal en reposo (60–100)" wide>
+              <LineChart series={[{ name: "Pulso", color: C.s1, points: hr }]} unit="lpm" band={[60, 100]} span={span} />
+            </ChartCard>
+            <ChartCard title="Oxígeno en sangre" subtitle="SpO₂ %">
+              <LineChart series={[{ name: "SpO₂", color: C.s1, points: spo2 }]} unit="%" span={span} yMin={85} yMax={100} />
+            </ChartCard>
+            <ChartCard title="Presión arterial" subtitle="mmHg">
+              <LineChart
+                series={[
+                  { name: "Sistólica", color: C.s1, points: sys },
+                  { name: "Diastólica", color: C.s2, points: dia },
+                ]}
+                unit="mmHg"
+                span={span}
+              />
+            </ChartCard>
+            <ChartCard title="Pulso promedio por hora del día" subtitle="lpm · horas sin datos quedan vacías">
+              <BarChart bars={hourly.map((b) => ({ label: `${b.h}`, value: b.v, tip: b.n ? `${b.h}:00 · ${Math.round(b.v)} lpm · ${b.n} lecturas` : `${b.h}:00 · sin datos` }))} />
+            </ChartCard>
+            <ChartCard title="Tiempo en cada zona de pulso" subtitle="% de las lecturas de pulso">
+              <ZoneBars zones={zones} total={hrVals.length} />
+            </ChartCard>
+          </div>
+
+          <details className="table-view">
+            <summary>Ver tabla de lecturas ({Math.min(data.length, 200)} más recientes)</summary>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fecha</th>
+                    <th>Dispositivo</th>
+                    <th>Métrica</th>
+                    <th className="num">Valor</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data
+                    .slice(-200)
+                    .reverse()
+                    .map((r, i) => (
+                      <tr key={i}>
+                        <td>{new Date(r.t).toLocaleString("es")}</td>
+                        <td>{r.device}</td>
+                        <td>{METRIC_LABEL[r.metric] || r.metric}</td>
+                        <td className="num">{fmt(r.value, r.metric === "temp" ? 1 : 0)}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </>
+      )}
+    </section>
+  );
+}
+
+const METRIC_LABEL = { hr: "Pulso (lpm)", spo2: "SpO₂ (%)", sys: "Sistólica (mmHg)", dia: "Diastólica (mmHg)", steps: "Pasos", temp: "Temperatura (°C)", battery: "Batería (%)" };
+
+const fmtTime = (t, span) =>
+  new Date(t).toLocaleString("es", span <= 2 * 86400000 ? { hour: "2-digit", minute: "2-digit" } : { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+
+const Kpi = ({ label, value, unit, sub }) => (
+  <div className="kpi">
+    <span className="muted">{label}</span>
+    <b>
+      {value}
+      {unit && <small> {unit}</small>}
+    </b>
+    <span className="muted sub">{sub}</span>
+  </div>
+);
+
+const ChartCard = ({ title, subtitle, wide, children }) => (
+  <div className={`chart-card ${wide ? "wide" : ""}`}>
+    <h3>{title}</h3>
+    <p className="muted">{subtitle}</p>
+    {children}
+  </div>
+);
+
+function useWidth() {
+  const ref = useRef(null);
+  const [w, setW] = useState(300);
+  useEffect(() => {
+    if (!ref.current) return;
+    const ro = new ResizeObserver(([e]) => setW(Math.max(200, e.contentRect.width)));
+    ro.observe(ref.current);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, w];
+}
+
+// Promedia en cubetas de tiempo cuando hay demasiados puntos para el ancho disponible
+function downsample(points, max) {
+  if (points.length <= max) return points.map((p) => ({ t: p.t, v: p.value }));
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const size = (t1 - t0) / max || 1;
+  const out = [];
+  let i = 0;
+  for (let b = 0; b < max && i < points.length; b++) {
+    const end = t0 + (b + 1) * size;
+    let st = 0, sv = 0, n = 0;
+    while (i < points.length && (points[i].t <= end || b === max - 1)) {
+      st += points[i].t;
+      sv += points[i].value;
+      n++;
+      i++;
+    }
+    if (n) out.push({ t: st / n, v: sv / n });
+  }
+  return out;
+}
+
+function niceTicks(min, max, count = 4) {
+  const step0 = (max - min) / count || 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= step0);
+  const ticks = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) ticks.push(+v.toFixed(6));
+  return ticks;
+}
+
+function LineChart({ series, unit, band, span, yMin, yMax }) {
+  const [ref, w] = useWidth();
+  const [hover, setHover] = useState(null);
+  const h = 200, m = { l: 36, r: 14, t: 10, b: 24 };
+  const ser = series.map((s) => ({ ...s, pts: downsample(s.points, Math.floor(w / 3)) })).filter((s) => s.pts.length);
+  if (!ser.length)
+    return (
+      <div className="chart" ref={ref}>
+        <div className="spark-empty" style={{ height: h }}>Sin datos en este rango</div>
+      </div>
+    );
+
+  const all = ser.flatMap((s) => s.pts);
+  const tMin = Math.min(...all.map((p) => p.t)), tMax = Math.max(...all.map((p) => p.t));
+  let vMin = Math.min(...all.map((p) => p.v), ...(band ? [band[0]] : [])), vMax = Math.max(...all.map((p) => p.v), ...(band ? [band[1]] : []));
+  if (yMin != null) vMin = Math.min(yMin, vMin);
+  if (yMax != null) vMax = Math.max(yMax, vMax);
+  const pad = (vMax - vMin) * 0.08 || 5;
+  vMin -= pad;
+  vMax += pad;
+  const x = (t) => m.l + (tMax === tMin ? (w - m.l - m.r) / 2 : ((t - tMin) / (tMax - tMin)) * (w - m.l - m.r));
+  const y = (v) => m.t + (1 - (v - vMin) / (vMax - vMin)) * (h - m.t - m.b);
+  const yt = niceTicks(vMin, vMax);
+  const xt = tMax === tMin ? [tMin] : Array.from({ length: 4 }, (_, i) => tMin + ((tMax - tMin) * i) / 3);
+
+  const onMove = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const px = ((e.clientX - r.left) / r.width) * w;
+    const t = tMin + ((px - m.l) / (w - m.l - m.r)) * (tMax - tMin);
+    const near = ser.map((s) => s.pts.reduce((a, p) => (Math.abs(p.t - t) < Math.abs(a.t - t) ? p : a), s.pts[0]));
+    setHover({ t: near[0].t, near, px: x(near[0].t) });
+  };
+
+  return (
+    <div className="chart" ref={ref}>
+      {ser.length > 1 && (
+        <div className="legend">
+          {ser.map((s) => (
+            <span key={s.name}>
+              <i style={{ background: s.color }} />
+              {s.name}
+            </span>
+          ))}
+        </div>
+      )}
+      <svg width={w} height={h} onPointerMove={onMove} onPointerLeave={() => setHover(null)} role="img" aria-label={`Gráfico de ${ser.map((s) => s.name).join(" y ")}`}>
+        {band && <rect x={m.l} width={w - m.l - m.r} y={y(band[1])} height={y(band[0]) - y(band[1])} fill="#8b9bb8" opacity="0.08" />}
+        {yt.map((v) => (
+          <g key={v}>
+            <line x1={m.l} x2={w - m.r} y1={y(v)} y2={y(v)} stroke={C.grid} />
+            <text x={m.l - 6} y={y(v) + 4} textAnchor="end" className="axis">{v}</text>
+          </g>
+        ))}
+        {xt.map((t, i) => (
+          <text key={i} x={x(t)} y={h - 6} textAnchor={i === 0 ? "start" : i === xt.length - 1 ? "end" : "middle"} className="axis">
+            {fmtTime(t, span)}
+          </text>
+        ))}
+        {ser.map((s) =>
+          s.pts.length === 1 ? (
+            <circle key={s.name} cx={x(s.pts[0].t)} cy={y(s.pts[0].v)} r="4" fill={s.color} stroke={C.surface} strokeWidth="2" />
+          ) : (
+            <polyline key={s.name} points={s.pts.map((p) => `${x(p.t)},${y(p.v)}`).join(" ")} fill="none" stroke={s.color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          )
+        )}
+        {hover && (
+          <g pointerEvents="none">
+            <line x1={hover.px} x2={hover.px} y1={m.t} y2={h - m.b} stroke={C.ink2} strokeDasharray="3 3" />
+            {hover.near.map((p, i) => (
+              <circle key={i} cx={x(p.t)} cy={y(p.v)} r="4.5" fill={ser[i].color} stroke={C.surface} strokeWidth="2" />
+            ))}
+          </g>
+        )}
+        <rect x={m.l} y={m.t} width={w - m.l - m.r} height={h - m.t - m.b} fill="transparent" />
+      </svg>
+      {hover && (
+        <div className="tip" style={{ left: Math.min(Math.max(hover.px, 70), w - 70) }}>
+          <div className="muted">{new Date(hover.t).toLocaleString("es")}</div>
+          {hover.near.map((p, i) => (
+            <div key={i}>
+              <i style={{ background: ser[i].color }} /> {ser[i].name}: <b>{fmt(p.v, unit === "°C" ? 1 : 0)}</b> {unit}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BarChart({ bars }) {
+  const [ref, w] = useWidth();
+  const [hover, setHover] = useState(null);
+  const h = 180, m = { l: 36, r: 6, t: 10, b: 22 };
+  const vals = bars.map((b) => b.value).filter((v) => v != null);
+  if (!vals.length)
+    return (
+      <div className="chart" ref={ref}>
+        <div className="spark-empty" style={{ height: h }}>Sin datos en este rango</div>
+      </div>
+    );
+  const vMax = Math.max(...vals) * 1.1;
+  const yt = niceTicks(0, vMax);
+  const top = Math.max(vMax, yt[yt.length - 1]);
+  const slot = (w - m.l - m.r) / bars.length;
+  const bw = Math.max(2, slot - 2); // 2px de separación entre barras
+  const y = (v) => m.t + (1 - v / top) * (h - m.t - m.b);
+  return (
+    <div className="chart" ref={ref}>
+      <svg width={w} height={h} onPointerLeave={() => setHover(null)} role="img" aria-label="Pulso promedio por hora">
+        {yt.map((v) => (
+          <g key={v}>
+            <line x1={m.l} x2={w - m.r} y1={y(v)} y2={y(v)} stroke={C.grid} />
+            <text x={m.l - 6} y={y(v) + 4} textAnchor="end" className="axis">{v}</text>
+          </g>
+        ))}
+        {bars.map((b, i) => {
+          const x0 = m.l + i * slot + 1;
+          const hgt = b.value != null ? h - m.b - y(b.value) : 0;
+          const r = Math.min(4, bw / 2, hgt);
+          return (
+            <g key={i} onPointerEnter={() => setHover(i)}>
+              <rect x={m.l + i * slot} y={m.t} width={slot} height={h - m.t - m.b} fill="transparent" />
+              {b.value != null && (
+                <path
+                  d={`M${x0},${h - m.b} V${y(b.value) + r} Q${x0},${y(b.value)} ${x0 + r},${y(b.value)} H${x0 + bw - r} Q${x0 + bw},${y(b.value)} ${x0 + bw},${y(b.value) + r} V${h - m.b} Z`}
+                  fill={C.s1}
+                  opacity={hover == null || hover === i ? 1 : 0.55}
+                />
+              )}
+              {i % 3 === 0 && (
+                <text x={x0 + bw / 2} y={h - 6} textAnchor="middle" className="axis">{b.label}h</text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      {hover != null && (
+        <div className="tip" style={{ left: Math.min(Math.max(m.l + hover * slot + slot / 2, 70), w - 70) }}>
+          {bars[hover].tip}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ZoneBars({ zones, total }) {
+  if (!total) return <div className="spark-empty" style={{ height: 120 }}>Sin datos en este rango</div>;
+  return (
+    <div className="zones">
+      {zones.map((z) => {
+        const p = (z.n / total) * 100;
+        return (
+          <div key={z.label} className="zone-row" title={`${z.label} (${z.range} lpm): ${z.n} lecturas`}>
+            <span className="zone-label">
+              {z.label} <span className="muted">{z.range}</span>
+            </span>
+            <div className="zone-track">
+              <div style={{ width: `${p}%` }} />
+            </div>
+            <b className="num">{p.toFixed(0)} %</b>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function useNow(active) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -1379,6 +1857,41 @@ h1{font-size:1.3rem} h2{font-size:1.1rem}
 .spark{width:100%;display:block;margin-top:10px}
 .spark-empty{display:grid;place-items:center;color:#56637f;font-size:.8rem;margin-top:10px;border:1px dashed #1f2a47;border-radius:8px}
 .ring-row{display:flex;align-items:center;gap:12px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #1f2a47}
+.tab{background:none;border:0;border-bottom:2px solid transparent;color:#8b9bb8;padding:10px 14px;font-size:.95rem;font-weight:600;cursor:pointer}
+.tab.on{color:#e2e8f0;border-bottom-color:#ff4d6d}
+.filters{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin-bottom:16px}
+.seg{display:inline-flex;background:#121a2e;border:1px solid #2a3758;border-radius:10px;padding:2px}
+.seg button{background:none;border:0;color:#8b9bb8;padding:6px 12px;border-radius:8px;font-weight:600;cursor:pointer}
+.seg button.on{background:#24305a;color:#e2e8f0}
+.filters select{background:#121a2e;color:#e2e8f0;border:1px solid #2a3758;border-radius:10px;padding:7px 10px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.kpi{background:#121a2e;border:1px solid #1f2a47;border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:2px;min-width:0}
+.kpi b{font-size:1.7rem;font-weight:800;font-variant-numeric:tabular-nums}
+.kpi b small{font-size:.8rem;font-weight:500;color:#8b9bb8}
+.kpi .sub{font-size:.75rem}
+.charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.chart-card{background:#121a2e;border:1px solid #1f2a47;border-radius:14px;padding:14px;min-width:0}
+.chart-card.wide{grid-column:1/-1}
+.chart-card h3{margin:0;font-size:1rem}
+.chart-card>p{margin:2px 0 8px}
+.chart{position:relative;width:100%}
+.chart svg{display:block;touch-action:pan-y}
+.axis{fill:#8b9bb8;font-size:11px;font-variant-numeric:tabular-nums}
+.legend{display:flex;gap:14px;font-size:.8rem;color:#c3cce0;margin-bottom:6px}
+.legend i,.tip i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.tip{position:absolute;top:8px;transform:translateX(-50%);background:#0b1020;border:1px solid #2a3758;border-radius:8px;padding:6px 10px;font-size:.8rem;pointer-events:none;white-space:nowrap;box-shadow:0 4px 14px #0008}
+.zones{display:flex;flex-direction:column;gap:12px;padding-top:6px}
+.zone-row{display:grid;grid-template-columns:120px 1fr 48px;gap:10px;align-items:center;font-size:.85rem}
+.zone-track{height:14px;background:#1b2540;border-radius:4px;overflow:hidden}
+.zone-track div{height:100%;background:#3987e5;border-radius:0 4px 4px 0;min-width:2px}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.table-view{margin-top:16px;background:#121a2e;border:1px solid #1f2a47;border-radius:14px;padding:12px 14px}
+.table-view summary{cursor:pointer;font-weight:700}
+.table-wrap{max-height:360px;overflow:auto;margin-top:10px}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{padding:6px 8px;border-bottom:1px solid #1f2a47;text-align:left}
+th{color:#8b9bb8;font-weight:600;position:sticky;top:0;background:#121a2e}
 .explorer{margin-top:14px;background:#121a2e;border:1px solid #1f2a47;border-radius:14px;padding:12px 14px}
 .explorer summary{cursor:pointer;font-weight:700}
 .svc{margin-top:10px;font-size:.9rem}

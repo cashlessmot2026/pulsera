@@ -24,3 +24,6 @@ create policy "anon puede insertar lecturas" on public.lecturas
 drop policy if exists "anon puede leer lecturas" on public.lecturas;
 create policy "anon puede leer lecturas" on public.lecturas
   for select to anon, authenticated using (true);
+
+-- Evita guardar dos veces el mismo registro (sincronizaciones repetidas)
+create unique index if not exists lecturas_unicas on public.lecturas (device_id, metric, recorded_at, value);
