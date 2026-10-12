@@ -76,6 +76,69 @@ const VENDOR_SERVICES = {
   "000001ff-3c17-d293-8e48-14fe2e4da212": "Propietario (GloryFit)",
   "0000d0ff-3c17-d293-8e48-14fe2e4da212": "Propietario (Telink)",
 };
+VENDOR_SERVICES["6e400001-b5a3-f393-e0a9-e50e24dcca9d"] = "Nordic UART variante (FitPro)";
+
+/* ============================================================
+   Protocolo FitPro (pulseras genéricas con Nordic UART: M3/M4/M5, JW-10…)
+   Basado en la ingeniería inversa de Gadgetbridge (FitProConstants/FitProDeviceSupport).
+   Paquete: CD | lenHi lenLo (total-3) | grupo | 01 | comando | dataLenHi dataLenLo | datos…
+   ============================================================ */
+const isUartService = (u) => /^6e400001-b5a3-f393-e0a9-e50e24dcca9[de]$/.test(u);
+const isUartTx = (u) => /^6e400002-b5a3-f393-e0a9-e50e24dcca9[de]$/.test(u);
+const isUartRx = (u) => /^6e400003-b5a3-f393-e0a9-e50e24dcca9[de]$/.test(u);
+
+const fitpro = {
+  craft(group, cmd, data = []) {
+    const total = 8 + data.length;
+    return new Uint8Array([0xcd, ((total - 3) >> 8) & 255, (total - 3) & 255, group, 0x01, cmd, (data.length >> 8) & 255, data.length & 255, ...data]);
+  },
+  ack(p) {
+    const size = ((p[1] << 8) | p[2]) + 3;
+    return new Uint8Array([0xdc, 0x00, 0x05, p[3], 0x01, (size >> 8) & 255, size & 255, 0x01]);
+  },
+  time() {
+    const d = new Date();
+    const v =
+      (d.getSeconds() | ((d.getFullYear() - 2000) << 26) | ((d.getMonth() + 1) << 22) | (d.getDate() << 17) | (d.getHours() << 12) | (d.getMinutes() << 6)) >>> 0;
+    return [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+  },
+  init() {
+    const c = fitpro.craft;
+    return [
+      c(0x12, 0x0a, [0x02]),
+      c(0x12, 0x01, fitpro.time()), // fecha y hora
+      c(0x1a, 0x0a),
+      c(0x1a, 0x0c),
+      c(0x12, 0x15, [0x06]), // idioma español
+      c(0x12, 0xff, [0x01]),
+      c(0x1a, 0x01),
+      c(0x1a, 0x0f),
+      c(0x1a, 0x10), // info de hardware
+      c(0x20, 0x02), // info de la pulsera
+      c(0x15, 0x06, [0x01]), // pasos en tiempo real / resumen del día
+    ];
+  },
+  measureHr: (on) => fitpro.craft(0x12, 0x18, [on ? 1 : 0]),
+  // Decodifica un paquete completo → { patch, ack }
+  decode(p) {
+    if (p[0] !== 0xcd || p.length < 8) return {};
+    const group = p[3], cmd = p[5];
+    const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+    if (group === 0x15 && cmd === 0x0e && p.length >= 20) {
+      const patch = {};
+      if (p[19] > 0) patch.hr = p[19];
+      if (p[17] > 0 && p[18] > 0) Object.assign(patch, { sys: p[17], dia: p[18], bpPulse: p[19] || undefined });
+      if (p[13] >= 70 && p[13] <= 100) patch.spo2 = p[13];
+      return { patch, ack: true };
+    }
+    if (group === 0x15 && cmd === 0x0c && p.length >= 20) {
+      return { patch: { steps: dv.getUint32(10), stepDistance: dv.getUint32(14), calories: dv.getUint16(18) }, ack: true };
+    }
+    if ((group === 0x15 && [0x02, 0x03, 0x07, 0x08, 0x10].includes(cmd)) || group === 0x20 || group === 0x1a) return { ack: true };
+    return {};
+  },
+};
+
 const vendorKey = (k) => (/^\d+$/.test(k) ? Number(k) : k);
 const ALL_SERVICES = [...Object.values(SVC), ...Object.keys(VENDOR_SERVICES).map(vendorKey)];
 
@@ -241,6 +304,7 @@ function App() {
 
   const btDevices = useRef(new Map()); // id → BluetoothDevice
   const chars = useRef(new Map()); // `${id}|${servicio}|${caracteristica}` → BluetoothRemoteGATTCharacteristic
+  const drivers = useRef(new Map()); // id → { tx, buf, chain } para protocolos propietarios (FitPro)
   const demoTimers = useRef(new Map()); // id → intervalId
   const names = useRef(new Map());
   const records = useRef([]); // registros en memoria (para CSV)
@@ -343,6 +407,59 @@ function App() {
     }
   };
 
+  // Escrituras en serie (BLE no admite dos operaciones GATT simultáneas), con pausa entre paquetes
+  const sendPackets = (id, packets, gap = 200) => {
+    const drv = drivers.current.get(id);
+    if (!drv) return Promise.resolve();
+    drv.chain = drv.chain.then(async () => {
+      for (const data of packets) {
+        try {
+          if (drv.tx.properties.writeWithoutResponse) await drv.tx.writeValueWithoutResponse(data);
+          else await drv.tx.writeValueWithResponse(data);
+          dispatch({ type: "log", id, entry: { t: Date.now(), dir: "tx", chr: uuidLabel(drv.tx.uuid), hex: toHex(new DataView(data.buffer)) } });
+        } catch (e) {
+          console.warn("Error al escribir a la pulsera", e);
+        }
+        await new Promise((r) => setTimeout(r, gap));
+      }
+    });
+    return drv.chain;
+  };
+
+  // Reensambla paquetes FitPro (pueden llegar partidos en varias notificaciones de 20 bytes)
+  const onFitproData = (id, dv) => {
+    const drv = drivers.current.get(id);
+    if (!drv) return;
+    const bytes = Array.from(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
+    if (!drv.buf.length && bytes[0] !== 0xcd) return; // fragmento suelto o ACK de la pulsera
+    drv.buf.push(...bytes);
+    while (drv.buf.length >= 3) {
+      const total = ((drv.buf[1] << 8) | drv.buf[2]) + 3;
+      if (total > 2048) {
+        drv.buf = [];
+        break;
+      }
+      if (drv.buf.length < total) break;
+      const pkt = new Uint8Array(drv.buf.splice(0, total));
+      const { patch, ack } = fitpro.decode(pkt);
+      if (ack) sendPackets(id, [fitpro.ack(pkt)], 50);
+      if (patch && Object.keys(patch).length) push(id, patch);
+      if (drv.buf.length && drv.buf[0] !== 0xcd) drv.buf = [];
+    }
+  };
+
+  const command = (id, action) => {
+    if (action === "hr-start") {
+      sendPackets(id, [fitpro.measureHr(true)]);
+      dispatch({ type: "upsert", id, patch: { measuring: true } });
+    } else if (action === "hr-stop") {
+      sendPackets(id, [fitpro.measureHr(false)]);
+      dispatch({ type: "upsert", id, patch: { measuring: false } });
+    } else if (action === "sync") {
+      sendPackets(id, fitpro.init());
+    }
+  };
+
   const connect = useCallback(
     async (device) => {
       const id = device.id;
@@ -360,6 +477,7 @@ function App() {
         const info = {};
         const explore = [];
         const standard = new Set(Object.values(SVC));
+        let uartTx = null, uartRx = null;
 
         for (const s of services) {
           const u = shortUuid(s.uuid);
@@ -371,13 +489,15 @@ function App() {
               const key = `${id}|${s.uuid}|${ch.uuid}`;
               chars.current.set(key, ch);
               entry.chars.push({ key, uuid: ch.uuid, props: propsList(ch.properties) });
+              if (isUartTx(ch.uuid)) uartTx = ch;
               if (ch.properties.notify || ch.properties.indicate) {
-                ch.oncharacteristicvaluechanged = (e) =>
-                  dispatch({
-                    type: "log",
-                    id,
-                    entry: { t: Date.now(), dir: "rx", chr: uuidLabel(ch.uuid), hex: toHex(e.target.value) },
-                  });
+                const uart = isUartRx(ch.uuid);
+                if (uart) uartRx = ch;
+                ch.oncharacteristicvaluechanged = (e) => {
+                  const dv = e.target.value;
+                  dispatch({ type: "log", id, entry: { t: Date.now(), dir: "rx", chr: uuidLabel(ch.uuid), hex: toHex(dv) } });
+                  if (uart) onFitproData(id, dv);
+                };
                 await ch.startNotifications().catch(() => {});
               }
             }
@@ -410,7 +530,17 @@ function App() {
           }
         }
 
-        dispatch({ type: "upsert", id, patch: { status: "connected", features: [...features], info, explore } });
+        let protocol = null;
+        if (uartTx && uartRx) {
+          // Nordic UART → intentar protocolo FitPro
+          protocol = "fitpro";
+          drivers.current.set(id, { tx: uartTx, buf: [], chain: Promise.resolve() });
+          ["hr", "spo2", "bp", "steps"].forEach((f) => features.add(f));
+          info.protocol = "FitPro";
+        }
+
+        dispatch({ type: "upsert", id, patch: { status: "connected", features: [...features], info, explore, protocol } });
+        if (protocol === "fitpro") sendPackets(id, fitpro.init());
       } catch (e) {
         dispatch({ type: "upsert", id, patch: { status: "disconnected" } });
         setError(`No se pudo conectar a ${device.name || "el dispositivo"}: ${e.message}`);
@@ -621,6 +751,7 @@ function App() {
             onRemove={remove}
             onWrite={writeChar}
             onRead={readChar}
+            onCommand={command}
           />
         ))
       )}
@@ -635,7 +766,7 @@ function App() {
    ============================================================ */
 const STATUS_LABEL = { connecting: "Conectando…", connected: "Conectado", disconnected: "Desconectado" };
 
-function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead }) {
+function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead, onCommand }) {
   const m = d.metrics;
   const f = new Set(d.features);
   const ago = useNow(d.status === "connected");
@@ -657,11 +788,29 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead }
           </p>
         </div>
         <div className="actions">
+          {d.status === "connected" && d.protocol === "fitpro" && (
+            <>
+              <button
+                className={`btn sm ${d.measuring ? "" : "primary"}`}
+                onClick={() => onCommand(d.id, d.measuring ? "hr-stop" : "hr-start")}
+              >
+                {d.measuring ? "■ Detener medición" : "❤ Medir"}
+              </button>
+              <button className="btn sm" onClick={() => onCommand(d.id, "sync")}>⟳ Sincronizar</button>
+            </>
+          )}
           {d.status === "connected" && <button className="btn sm" onClick={() => onDisconnect(d.id)}>Desconectar</button>}
           {d.status === "disconnected" && !d.demo && <button className="btn sm primary" onClick={() => onReconnect(d.id)}>Reconectar</button>}
           <button className="btn sm ghost" onClick={() => onRemove(d.id)}>Quitar</button>
         </div>
       </div>
+
+      {d.status === "connected" && d.protocol === "fitpro" && (
+        <p className="muted pad">
+          Protocolo FitPro detectado. Pulsa <b>❤ Medir</b> y mantén la pulsera bien ajustada: la medición tarda entre 30 y 60 s y
+          entonces llegan pulso, presión y SpO₂.
+        </p>
+      )}
 
       {d.status === "connected" && d.features.length === 0 && (
         <p className="muted pad">
@@ -673,7 +822,18 @@ function DevicePanel({ d, onDisconnect, onReconnect, onRemove, onWrite, onRead }
 
       <div className="grid">
         {f.has("hr") && <HeartCard m={m} />}
-        {f.has("hr") && <HrvCard m={m} />}
+        {f.has("hr") && !d.protocol && <HrvCard m={m} />}
+        {f.has("steps") && (
+          <Card title="Pasos del día" icon="👣" accent="#4cc9f0">
+            <Big value={m.steps ?? "--"} unit="pasos" />
+            <Stats
+              items={[
+                ["Distancia", m.stepDistance != null ? fmt(m.stepDistance / 1000, 2) : "--", "km"],
+                ["Calorías", m.calories ?? "--", "kcal"],
+              ]}
+            />
+          </Card>
+        )}
         {f.has("spo2") && <Spo2Card m={m} />}
         {f.has("temp") && (
           <Card title="Temperatura corporal" icon="🌡" accent="#ffb703">
@@ -761,6 +921,20 @@ function Explorer({ d, onWrite, onRead }) {
           </select>
           <input value={hex} onChange={(e) => setHex(e.target.value)} placeholder="Bytes en hex, ej. ab 00 04 ff 31 0a 01" />
           <button className="btn sm primary" type="submit">Enviar</button>
+          <div className="presets">
+            <span className="muted">Comandos FitPro:</span>
+            {[
+              ["📳 Vibrar pulsera", "cd 00 06 12 01 0b 00 01 01"],
+              ["❤ Medir pulso", "cd 00 06 12 01 18 00 01 01"],
+              ["■ Detener", "cd 00 06 12 01 18 00 01 00"],
+              ["👣 Pasos", "cd 00 06 15 01 06 00 01 01"],
+              ["ℹ Info", "cd 00 05 20 01 02 00 00"],
+            ].map(([label, cmd]) => (
+              <button key={label} type="button" className="btn sm ghost" onClick={() => setHex(cmd)}>
+                {label}
+              </button>
+            ))}
+          </div>
         </form>
       )}
 
@@ -1002,6 +1176,7 @@ code{font-family:ui-monospace,Consolas,monospace;font-size:.85em;color:#a5b4fc;w
 .tx{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
 .tx select,.tx input{background:#0b1020;color:#e2e8f0;border:1px solid #2a3758;border-radius:8px;padding:6px 8px;font-family:ui-monospace,Consolas,monospace}
 .tx input{flex:1;min-width:180px}
+.presets{display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%}
 .log{margin-top:12px;max-height:260px;overflow:auto;background:#0b1020;border-radius:8px;padding:8px;font-family:ui-monospace,Consolas,monospace;font-size:.8rem}
 .pkt{padding:2px 0;word-break:break-all}
 .pkt.tx b{color:#ffb703}.pkt.rx b{color:#06d6a0}.pkt.read b{color:#4cc9f0}
